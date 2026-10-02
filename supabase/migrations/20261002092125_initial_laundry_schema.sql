@@ -21,6 +21,17 @@ create table public.customers (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+create table public.offers (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (char_length(name) between 2 and 100),
+  percentage numeric(5,2) not null check (percentage>0 and percentage<=100),
+  starts_at timestamptz not null,
+  ends_at timestamptz not null check (ends_at>starts_at),
+  active boolean not null default true,
+  created_by uuid not null references public.staff_profiles(id) on delete restrict,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 create table public.orders (
   id uuid primary key default gen_random_uuid(),
   order_ref text unique not null,
@@ -29,6 +40,10 @@ create table public.orders (
   subtotal_cents bigint not null check (subtotal_cents>=0),
   vat_cents bigint not null default 0 check (vat_cents=0),
   discount_cents bigint not null default 0 check (discount_cents>=0),
+  offer_id uuid references public.offers(id) on delete restrict,
+  offer_name text not null default '',
+  offer_percentage numeric(5,2) not null default 0 check (offer_percentage between 0 and 100),
+  offer_discount_cents bigint not null default 0 check (offer_discount_cents>=0),
   total_cents bigint not null check (total_cents>=0),
   expected_at timestamptz,
   notes text not null default '',
@@ -66,12 +81,14 @@ create table public.business_settings(key text primary key,value text not null,u
 create index orders_status_created_idx on public.orders(status,created_at desc);
 create index orders_customer_idx on public.orders(customer_id,created_at desc);
 create index orders_expected_idx on public.orders(expected_at) where status not in ('collected','cancelled');
+create index offers_window_idx on public.offers(active,starts_at,ends_at);
 create index order_items_order_idx on public.order_items(order_id);
 create index payments_order_idx on public.payments(order_id);
 create index whatsapp_status_idx on public.whatsapp_events(status,created_at) where status in ('queued','failed');
 
 alter table public.staff_profiles enable row level security;
 alter table public.customers enable row level security;
+alter table public.offers enable row level security;
 alter table public.orders enable row level security;
 alter table public.order_items enable row level security;
 alter table public.order_events enable row level security;

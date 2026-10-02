@@ -69,13 +69,19 @@ def init_db():
     CREATE TABLE IF NOT EXISTS refunds(id INTEGER PRIMARY KEY,order_id INTEGER NOT NULL REFERENCES orders(id),amount_cents INTEGER NOT NULL,method TEXT NOT NULL CHECK(method IN('cash','card','bank')),reason TEXT NOT NULL,client_key TEXT UNIQUE NOT NULL,actor TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,expense_date TEXT NOT NULL,category TEXT NOT NULL,description TEXT NOT NULL,amount_cents INTEGER NOT NULL,actor TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS business_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS offers(id INTEGER PRIMARY KEY,name TEXT NOT NULL,percentage REAL NOT NULL CHECK(percentage>0 AND percentage<=100),starts_at TEXT NOT NULL,ends_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_by TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_orders_status_date ON orders(status,created_at); CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id); CREATE INDEX IF NOT EXISTS idx_customer_phone ON customers(phone);
+    CREATE INDEX IF NOT EXISTS idx_offers_window ON offers(active,starts_at,ends_at);
     '''
     with tx() as c: c.executescript(schema)
     with tx() as c:
         for table,column,definition in [
             ('customers','important_notes',"TEXT NOT NULL DEFAULT ''"),
             ('orders','discount_cents','INTEGER NOT NULL DEFAULT 0'),
+            ('orders','offer_id','INTEGER'),
+            ('orders','offer_name',"TEXT NOT NULL DEFAULT ''"),
+            ('orders','offer_percentage','REAL NOT NULL DEFAULT 0'),
+            ('orders','offer_discount_cents','INTEGER NOT NULL DEFAULT 0'),
             ('orders','updated_by',"TEXT NOT NULL DEFAULT ''"),
             ('users','permissions',"TEXT NOT NULL DEFAULT '[]'"),
             ('users','last_login','TEXT')]:
@@ -102,10 +108,18 @@ def allowed(user,permission):
     try: permissions=json.loads(user.get('permissions') or '[]')
     except Exception: permissions=[]
     return user.get('role')=='admin' or '*' in permissions or permission in permissions
+def offer_discount(subtotal,percentage):
+    subtotal=money(subtotal); percentage=Decimal(str(percentage or 0))
+    if percentage<=0:return Decimal('0.00')
+    return min(subtotal,money(subtotal*percentage/Decimal('100')))
+def active_offer(c,at=None):
+    at=at or now()
+    row=c.execute('SELECT * FROM offers WHERE active=1 AND starts_at<=? AND ends_at>=? ORDER BY starts_at DESC,id DESC LIMIT 1',(at,at)).fetchone()
+    return dict(row) if row else None
 def order_row(c,oid):
     r=c.execute('''SELECT o.*,c.name customer_name,c.phone,c.important_notes customer_notes,COALESCE((SELECT SUM(amount_cents) FROM payments p WHERE p.order_id=o.id),0)-COALESCE((SELECT SUM(amount_cents) FROM refunds r WHERE r.order_id=o.id),0) paid_cents,COALESCE((SELECT SUM(amount_cents) FROM refunds r WHERE r.order_id=o.id),0) refunded_cents FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?''',(oid,)).fetchone()
     if not r:return None
-    d=dict(r); d['items']=[dict(x) for x in c.execute('SELECT * FROM order_items WHERE order_id=?',(oid,))]; d['balance_cents']=d['total_cents']-d['paid_cents']; return d
+    d=dict(r); d['items']=[dict(x) for x in c.execute('SELECT * FROM order_items WHERE order_id=?',(oid,))]; d['balance_cents']=d['total_cents']-d['paid_cents']; d['total_discount_cents']=d['discount_cents']+d['offer_discount_cents']; return d
 def dispatch_whatsapp_events(limit=20):
     token=os.getenv('WHATSAPP_ACCESS_TOKEN','');phone_id=os.getenv('WHATSAPP_PHONE_NUMBER_ID','')
     if not token or not phone_id:return {'queued':True,'configured':False}
@@ -223,6 +237,17 @@ class App(SimpleHTTPRequestHandler):
             if not self.auth():return self.send_json({'error':'Unauthorized'},401)
             with db() as c: settings={x['key']:x['value'] for x in c.execute('SELECT * FROM business_settings')}
             return self.send_json({'settings':settings})
+        if path=='/api/active-offer':
+            if not self.auth():return self.send_json({'error':'Unauthorized'},401)
+            with db() as c: offer=active_offer(c)
+            return self.send_json({'offer':offer})
+        if path=='/api/admin/offers':
+            if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
+            current=now()
+            with db() as c: rows=[dict(x) for x in c.execute('SELECT * FROM offers ORDER BY starts_at DESC,id DESC')]
+            for row in rows:
+                row['status']='inactive' if not row['active'] else ('scheduled' if row['starts_at']>current else ('expired' if row['ends_at']<current else 'active'))
+            return self.send_json({'offers':rows})
         if path=='/api/admin/dashboard':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
             start=q.get('date',[datetime.now().astimezone().date().isoformat()])[0]
@@ -258,7 +283,7 @@ class App(SimpleHTTPRequestHandler):
                 paid=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM payments WHERE date(created_at) BETWEEN ? AND ?',(start,end)).fetchone()[0];refunded=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM refunds WHERE date(created_at) BETWEEN ? AND ?',(start,end)).fetchone()[0];summary['paid_cents']=paid-refunded;summary['refund_cents']=refunded
                 services=[dict(x) for x in c.execute("""SELECT oi.item,oi.service,SUM(oi.quantity) quantity,SUM(oi.line_cents) sales_cents FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status!='cancelled' AND date(o.created_at) BETWEEN ? AND ? GROUP BY oi.item,oi.service ORDER BY sales_cents DESC""",(start,end))]
                 summary['expenses_cents']=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM expenses WHERE expense_date BETWEEN ? AND ?',(start,end)).fetchone()[0]
-                summary['discount_cents']=c.execute("SELECT COALESCE(SUM(discount_cents),0) FROM orders WHERE status!='cancelled' AND date(created_at) BETWEEN ? AND ?",(start,end)).fetchone()[0]
+                summary['discount_cents']=c.execute("SELECT COALESCE(SUM(discount_cents+offer_discount_cents),0) FROM orders WHERE status!='cancelled' AND date(created_at) BETWEEN ? AND ?",(start,end)).fetchone()[0]
                 methods=[dict(x) for x in c.execute('''SELECT method,SUM(amount_cents) amount_cents FROM(SELECT method,amount_cents FROM payments WHERE date(created_at) BETWEEN ? AND ? UNION ALL SELECT method,-amount_cents FROM refunds WHERE date(created_at) BETWEEN ? AND ?)GROUP BY method''',(start,end,start,end))]
             summary['difference_cents']=summary['total_cents']-summary['paid_cents'];summary['profit_cents']=summary['paid_cents']-summary['expenses_cents'];return self.send_json({'from':start,'to':end,'summary':summary,'services':services,'by_method':methods})
         if path=='/api/admin/export.csv':
@@ -314,13 +339,14 @@ class App(SimpleHTTPRequestHandler):
                 calculated=[]; subtotal=Decimal('0')
                 for i in items:
                     unit,line,qty,w,h=price_for(i);subtotal+=line;calculated.append((i,unit,line,qty,w,h))
-                subtotal=money(subtotal); vat=money(subtotal*VAT); total=subtotal+vat
+                subtotal=money(subtotal); vat=money(subtotal*VAT)
                 with tx() as c:
                     old=c.execute('SELECT id FROM orders WHERE client_key=?',(key,)).fetchone()
                     if old:return self.send_json({'order':order_row(c,old['id']),'duplicate':True},200)
+                    offer=active_offer(c); offer_amount=offer_discount(subtotal,offer['percentage'] if offer else 0); total=subtotal+vat-offer_amount
                     t=now(); c.execute('INSERT INTO customers(name,phone,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(phone) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at',(name,phone,t,t));cid=c.execute('SELECT id FROM customers WHERE phone=?',(phone,)).fetchone()[0]
                     ref='LR-'+datetime.now().strftime('%Y%m%d')+'-'+secrets.token_hex(2).upper()
-                    c.execute('INSERT INTO orders(order_ref,customer_id,status,subtotal_cents,vat_cents,total_cents,expected_at,notes,client_key,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(ref,cid,'received',int(subtotal*100),int(vat*100),int(total*100),data.get('expected_at'),str(data.get('notes',''))[:1000],key,u['username'],t,t));oid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                    c.execute('INSERT INTO orders(order_ref,customer_id,status,subtotal_cents,vat_cents,total_cents,expected_at,notes,client_key,created_by,created_at,updated_at,offer_id,offer_name,offer_percentage,offer_discount_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(ref,cid,'received',int(subtotal*100),int(vat*100),int(total*100),data.get('expected_at'),str(data.get('notes',''))[:1000],key,u['username'],t,t,offer['id'] if offer else None,offer['name'] if offer else '',offer['percentage'] if offer else 0,int(offer_amount*100)));oid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
                     for i,unit,line,qty,w,h in calculated:c.execute('INSERT INTO order_items(order_id,category,item,size,service,quantity,width,height,unit_cents,line_cents) VALUES(?,?,?,?,?,?,?,?,?,?)',(oid,i['category'],i['item'],i.get('size'),i['service'],qty,str(w) if w else None,str(h) if h else None,int(unit*100),int(line*100)))
                     c.execute('INSERT INTO order_events(order_id,status,note,actor,created_at) VALUES(?,?,?,?,?)',(oid,'received','Order created',u['username'],t));queue_event(c,oid,cid,phone,'received');audit(c,u['username'],'create','order',oid)
                     amount=money(data.get('paid',0) or 0); method=data.get('payment_method')
@@ -344,11 +370,11 @@ class App(SimpleHTTPRequestHandler):
                 with tx() as c:
                     order=order_row(c,oid)
                     if not order or order['status']!='received':raise ValueError('Only received orders can be edited')
-                    discount=Decimal(order['discount_cents'])/100;total=max(Decimal('0'),subtotal+vat-discount)
+                    discount=Decimal(order['discount_cents'])/100;offer_amount=offer_discount(subtotal,order['offer_percentage']);total=max(Decimal('0'),subtotal+vat-offer_amount-discount)
                     if order['paid_cents']>int(total*100):raise ValueError('Edited total cannot be less than paid amount')
                     c.execute('DELETE FROM order_items WHERE order_id=?',(oid,))
                     for i,unit,line,qty,w,h in calculated:c.execute('INSERT INTO order_items(order_id,category,item,size,service,quantity,width,height,unit_cents,line_cents) VALUES(?,?,?,?,?,?,?,?,?,?)',(oid,i['category'],i['item'],i.get('size'),i['service'],qty,str(w) if w else None,str(h) if h else None,int(unit*100),int(line*100)))
-                    c.execute('UPDATE orders SET subtotal_cents=?,vat_cents=?,total_cents=?,expected_at=?,notes=?,updated_by=?,updated_at=? WHERE id=?',(int(subtotal*100),int(vat*100),int(total*100),data.get('expected_at'),str(data.get('notes',''))[:1000],u['username'],now(),oid));audit(c,u['username'],'edit','order',oid)
+                    c.execute('UPDATE orders SET subtotal_cents=?,vat_cents=?,offer_discount_cents=?,total_cents=?,expected_at=?,notes=?,updated_by=?,updated_at=? WHERE id=?',(int(subtotal*100),int(vat*100),int(offer_amount*100),int(total*100),data.get('expected_at'),str(data.get('notes',''))[:1000],u['username'],now(),oid));audit(c,u['username'],'edit','order',oid)
                     result=order_row(c,oid)
                 return self.send_json({'order':result})
             dm=re.fullmatch(r'/api/admin/orders/(\d+)/discount',path)
@@ -357,8 +383,8 @@ class App(SimpleHTTPRequestHandler):
                 oid=int(dm.group(1));discount=money(data.get('amount',0))
                 with tx() as c:
                     order=order_row(c,oid)
-                    if not order or discount<0 or int(discount*100)>order['subtotal_cents']+order['vat_cents']:raise ValueError('Invalid discount')
-                    total=order['subtotal_cents']+order['vat_cents']-int(discount*100)
+                    if not order or discount<0 or int(discount*100)>order['subtotal_cents']+order['vat_cents']-order['offer_discount_cents']:raise ValueError('Invalid discount')
+                    total=order['subtotal_cents']+order['vat_cents']-order['offer_discount_cents']-int(discount*100)
                     if total<order['paid_cents']:raise ValueError('Discount exceeds remaining balance')
                     c.execute('UPDATE orders SET discount_cents=?,total_cents=?,updated_by=?,updated_at=? WHERE id=?',(int(discount*100),total,u['username'],now(),oid));audit(c,u['username'],'discount','order',oid,str(discount));result=order_row(c,oid)
                 return self.send_json({'order':result})
@@ -396,6 +422,29 @@ class App(SimpleHTTPRequestHandler):
                         c.execute('INSERT INTO payments(order_id,amount_cents,method,client_key,actor,created_at) VALUES(?,?,?,?,?,?)',(oid,int(amount*100),method,key,u['username'],now()));audit(c,u['username'],'payment','order',oid,str(amount))
                     result=order_row(c,oid)
                 return self.send_json({'order':result})
+            if path=='/api/admin/offers':
+                if u['role']!='admin':return self.send_json({'error':'Forbidden'},403)
+                name=str(data.get('name','')).strip()[:100];percentage=money(data.get('percentage',0))
+                try:
+                    start_dt=datetime.fromisoformat(str(data.get('starts_at','')).replace('Z','+00:00'));end_dt=datetime.fromisoformat(str(data.get('ends_at','')).replace('Z','+00:00'))
+                except Exception:raise ValueError('Enter a valid start and deadline')
+                if start_dt.tzinfo is None or end_dt.tzinfo is None:raise ValueError('Offer dates must include a timezone')
+                starts_at=start_dt.astimezone(timezone.utc).isoformat(timespec='seconds');ends_at=end_dt.astimezone(timezone.utc).isoformat(timespec='seconds')
+                if len(name)<2 or percentage<=0 or percentage>100 or end_dt<=start_dt:raise ValueError('Enter a valid offer name, percentage, start, and deadline')
+                with tx() as c:
+                    conflict=c.execute('SELECT id FROM offers WHERE active=1 AND starts_at<? AND ends_at>? LIMIT 1',(ends_at,starts_at)).fetchone()
+                    if conflict:raise ValueError('This offer overlaps another active or scheduled offer')
+                    t=now();c.execute('INSERT INTO offers(name,percentage,starts_at,ends_at,active,created_by,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?)',(name,float(percentage),starts_at,ends_at,u['username'],t,t));oid=c.execute('SELECT last_insert_rowid()').fetchone()[0];audit(c,u['username'],'create','offer',oid,f'{percentage}% {starts_at} to {ends_at}')
+                    result=dict(c.execute('SELECT * FROM offers WHERE id=?',(oid,)).fetchone())
+                return self.send_json({'offer':result},201)
+            om=re.fullmatch(r'/api/admin/offers/(\d+)/deactivate',path)
+            if om:
+                if u['role']!='admin':return self.send_json({'error':'Forbidden'},403)
+                oid=int(om.group(1))
+                with tx() as c:
+                    if not c.execute('SELECT id FROM offers WHERE id=?',(oid,)).fetchone():raise ValueError('Offer not found')
+                    c.execute('UPDATE offers SET active=0,updated_at=? WHERE id=?',(now(),oid));audit(c,u['username'],'deactivate','offer',oid)
+                return self.send_json({'ok':True})
             if path=='/api/admin/staff/save':
                 if u['role']!='admin':return self.send_json({'error':'Forbidden'},403)
                 username=re.sub(r'[^a-z0-9_.-]','',str(data.get('username','')).lower())[:40];name=str(data.get('name','')).strip()[:100];role=data.get('role','staff');active=1 if data.get('active',True) else 0;permissions=data.get('permissions',[]);password=str(data.get('password',''))

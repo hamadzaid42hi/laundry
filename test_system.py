@@ -22,6 +22,15 @@ class CoreTests(unittest.TestCase):
         u,line,*_=server.price_for({'category':'إكسسوارات ومفروشات','item':'سجادة (م2)','service':'غسيل بالمتر','quantity':2,'width':2,'height':3})
         self.assertEqual(u,Decimal('8.00'));self.assertEqual(line,Decimal('96.00'))
     def test_vat_disabled(self): self.assertEqual(server.VAT,Decimal('0'))
+    def test_offer_discount_rounding_and_cap(self):
+        self.assertEqual(server.offer_discount(Decimal('19.99'),Decimal('15')),Decimal('3.00'))
+        self.assertEqual(server.offer_discount(Decimal('10.00'),Decimal('100')),Decimal('10.00'))
+        self.assertEqual(server.offer_discount(Decimal('10.00'),Decimal('0')),Decimal('0.00'))
+    def test_active_offer_respects_timeline(self):
+        with server.tx() as c:
+            c.execute("INSERT INTO offers(name,percentage,starts_at,ends_at,active,created_by,created_at,updated_at) VALUES('Current',10,'2026-01-01T00:00:00+00:00','2026-12-31T23:59:59+00:00',1,'admin',?,?)",(server.now(),server.now()))
+            self.assertEqual(server.active_offer(c,'2026-06-01T00:00:00+00:00')['name'],'Current')
+            self.assertIsNone(server.active_offer(c,'2027-01-01T00:00:00+00:00'))
     def test_password_hash(self):
         salt,h=server.hashpw('secret');self.assertEqual(server.hashpw('secret',bytes.fromhex(salt))[1],h);self.assertNotEqual(server.hashpw('wrong',bytes.fromhex(salt))[1],h)
     def test_notification_deduplication(self):
@@ -38,8 +47,10 @@ class CoreTests(unittest.TestCase):
     def test_operational_migration(self):
         with server.db() as c:
             tables={x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            self.assertTrue({'refunds','expenses','business_settings','audit_events'}.issubset(tables))
+            self.assertTrue({'refunds','expenses','business_settings','audit_events','offers'}.issubset(tables))
             self.assertIn('discount_cents',{x['name'] for x in c.execute('PRAGMA table_info(orders)')})
+            self.assertIn('offer_discount_cents',{x['name'] for x in c.execute('PRAGMA table_info(orders)')})
+            self.assertIn('offer_percentage',{x['name'] for x in c.execute('PRAGMA table_info(orders)')})
             self.assertIn('last_login',{x['name'] for x in c.execute('PRAGMA table_info(users)')})
     def test_permission_rules(self):
         self.assertTrue(server.allowed({'role':'staff','permissions':'["orders.create"]'},'orders.create'))
