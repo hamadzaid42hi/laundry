@@ -40,6 +40,7 @@ class CoreTests(unittest.TestCase):
             tables={x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertTrue({'refunds','expenses','business_settings','audit_events'}.issubset(tables))
             self.assertIn('discount_cents',{x['name'] for x in c.execute('PRAGMA table_info(orders)')})
+            self.assertIn('last_login',{x['name'] for x in c.execute('PRAGMA table_info(users)')})
     def test_permission_rules(self):
         self.assertTrue(server.allowed({'role':'staff','permissions':'["orders.create"]'},'orders.create'))
         self.assertFalse(server.allowed({'role':'staff','permissions':'[]'},'orders.cancel'))

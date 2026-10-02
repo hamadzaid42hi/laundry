@@ -9,6 +9,7 @@ create table public.staff_profiles (
   role text not null check (role in ('staff','admin')),
   permissions jsonb not null default '[]'::jsonb,
   active boolean not null default true,
+  last_login timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );

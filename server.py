@@ -77,7 +77,8 @@ def init_db():
             ('customers','important_notes',"TEXT NOT NULL DEFAULT ''"),
             ('orders','discount_cents','INTEGER NOT NULL DEFAULT 0'),
             ('orders','updated_by',"TEXT NOT NULL DEFAULT ''"),
-            ('users','permissions',"TEXT NOT NULL DEFAULT '[]'")]:
+            ('users','permissions',"TEXT NOT NULL DEFAULT '[]'"),
+            ('users','last_login','TEXT')]:
             if column not in {x['name'] for x in c.execute(f'PRAGMA table_info({table})')}:
                 c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
         defaults={'business_phone':'','tax_number':'','receipt_footer':'Thank you · شكراً لكم'}
@@ -181,9 +182,33 @@ class App(SimpleHTTPRequestHandler):
             sql+=' ORDER BY o.id DESC LIMIT 200'
             with db() as c: rows=[order_row(c,x['id']) for x in c.execute(sql,args)]
             return self.send_json({'orders':rows})
+        detail=re.fullmatch(r'/api/admin/orders/(\d+)',path)
+        if detail:
+            if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
+            oid=int(detail.group(1))
+            with db() as c:
+                order=order_row(c,oid)
+                if not order:return self.send_json({'error':'Order not found'},404)
+                order['payments']=[dict(x) for x in c.execute('SELECT * FROM payments WHERE order_id=? ORDER BY id',(oid,))]
+                order['refunds']=[dict(x) for x in c.execute('SELECT * FROM refunds WHERE order_id=? ORDER BY id',(oid,))]
+                order['events']=[dict(x) for x in c.execute('SELECT * FROM order_events WHERE order_id=? ORDER BY id',(oid,))]
+                order['audit']=[dict(x) for x in c.execute("SELECT * FROM audit_events WHERE entity_type='order' AND entity_id=? ORDER BY id DESC",(str(oid),))]
+            return self.send_json({'order':order})
+        if path=='/api/admin/customers':
+            if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
+            term=q.get('q',[''])[0].strip(); args=[]; where=''
+            if term:where='WHERE c.name LIKE ? OR c.phone LIKE ?';args=['%'+term+'%']*2
+            with db() as c: rows=[dict(x) for x in c.execute(f'''SELECT c.*,COUNT(o.id) visits,COALESCE(SUM(CASE WHEN o.status!='cancelled' THEN o.total_cents ELSE 0 END),0) spent_cents,COALESCE(SUM(CASE WHEN o.status!='cancelled' THEN MAX(0,o.total_cents-COALESCE(p.paid,0)+COALESCE(r.refunded,0)) ELSE 0 END),0) unpaid_cents FROM customers c LEFT JOIN orders o ON o.customer_id=c.id LEFT JOIN(SELECT order_id,SUM(amount_cents) paid FROM payments GROUP BY order_id)p ON p.order_id=o.id LEFT JOIN(SELECT order_id,SUM(amount_cents) refunded FROM refunds GROUP BY order_id)r ON r.order_id=o.id {where} GROUP BY c.id ORDER BY c.updated_at DESC LIMIT 200''',args)]
+            return self.send_json({'customers':rows})
+        if path=='/api/admin/payments':
+            if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
+            with db() as c:
+                payments=[dict(x) for x in c.execute('''SELECT p.*,o.order_ref,c.name customer_name FROM payments p JOIN orders o ON o.id=p.order_id JOIN customers c ON c.id=o.customer_id ORDER BY p.id DESC LIMIT 300''')]
+                refunds=[dict(x) for x in c.execute('''SELECT r.*,o.order_ref,c.name customer_name FROM refunds r JOIN orders o ON o.id=r.order_id JOIN customers c ON c.id=o.customer_id ORDER BY r.id DESC LIMIT 300''')]
+            return self.send_json({'payments':payments,'refunds':refunds})
         if path=='/api/admin/staff':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
-            with db() as c: rows=[dict(x) for x in c.execute('SELECT username,name,role,active,permissions,created_at FROM users ORDER BY role,name')]
+            with db() as c: rows=[dict(x) for x in c.execute('''SELECT u.username,u.name,u.role,u.active,u.permissions,u.created_at,u.last_login,COUNT(DISTINCT o.id) orders_created,COALESCE((SELECT SUM(p.amount_cents) FROM payments p WHERE p.actor=u.username),0) payments_received_cents FROM users u LEFT JOIN orders o ON o.created_by=u.username GROUP BY u.username ORDER BY u.role,u.name''')]
             return self.send_json({'staff':rows})
         if path=='/api/admin/audit':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
@@ -199,7 +224,8 @@ class App(SimpleHTTPRequestHandler):
             return self.send_json({'settings':settings})
         if path=='/api/admin/dashboard':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
-            start=datetime.now().astimezone().date().isoformat()
+            start=q.get('date',[datetime.now().astimezone().date().isoformat()])[0]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',start):return self.send_json({'error':'Invalid date'},400)
             with db() as c:
                 metrics=dict(c.execute('''SELECT COUNT(*) orders,COALESCE(SUM(total_cents),0) gross_cents,COALESCE(SUM(vat_cents),0) vat_cents,COALESCE(SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END),0) ready FROM orders WHERE date(created_at)=?''',(start,)).fetchone())
                 payments_today=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM payments WHERE date(created_at)=?',(start,)).fetchone()[0];refunds_today=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM refunds WHERE date(created_at)=?',(start,)).fetchone()[0];metrics['paid_cents']=payments_today-refunds_today
@@ -212,7 +238,16 @@ class App(SimpleHTTPRequestHandler):
                 staff_performance=[dict(x) for x in c.execute("""SELECT created_by username,COUNT(*) orders,SUM(CASE WHEN status!='cancelled' THEN total_cents ELSE 0 END) sales_cents FROM orders GROUP BY created_by ORDER BY sales_cents DESC""")]
                 unpaid=[dict(x) for x in c.execute("""SELECT o.order_ref,c.name,c.phone,o.total_cents-COALESCE(p.paid,0)+COALESCE(r.refunded,0) balance_cents FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN(SELECT order_id,SUM(amount_cents) paid FROM payments GROUP BY order_id)p ON p.order_id=o.id LEFT JOIN(SELECT order_id,SUM(amount_cents) refunded FROM refunds GROUP BY order_id)r ON r.order_id=o.id WHERE o.status!='cancelled' AND o.total_cents>COALESCE(p.paid,0)-COALESCE(r.refunded,0) ORDER BY balance_cents DESC LIMIT 100""")]
                 expenses=c.execute("SELECT COALESCE(SUM(amount_cents),0) FROM expenses WHERE expense_date=?",(start,)).fetchone()[0];metrics['expenses_cents']=expenses;metrics['profit_cents']=metrics['paid_cents']-expenses
-            return self.send_json({'metrics':metrics,'by_status':by_status,'by_method':by_method,'whatsapp':wa,'series':series,'top_services':top_services,'staff_performance':staff_performance,'unpaid':unpaid})
+                metrics['due_today']=c.execute("SELECT COUNT(*) FROM orders WHERE date(expected_at)=? AND status NOT IN ('collected','cancelled')",(start,)).fetchone()[0]
+                metrics['overdue']=c.execute("SELECT COUNT(*) FROM orders WHERE expected_at<datetime('now','localtime') AND status NOT IN ('collected','cancelled')").fetchone()[0]
+                metrics['failed_whatsapp']=c.execute("SELECT COUNT(*) FROM whatsapp_events WHERE status='failed'").fetchone()[0]
+                attention={
+                    'overdue':[dict(x) for x in c.execute("SELECT o.id,o.order_ref,c.name,o.expected_at FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.expected_at<datetime('now','localtime') AND o.status NOT IN ('collected','cancelled') ORDER BY o.expected_at LIMIT 20")],
+                    'ready':[dict(x) for x in c.execute("SELECT o.id,o.order_ref,c.name,o.expected_at FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.status='ready' ORDER BY o.updated_at LIMIT 20")],
+                    'failed':[dict(x) for x in c.execute("SELECT id,order_id,message_type,failure_reason FROM whatsapp_events WHERE status='failed' ORDER BY id DESC LIMIT 20")],
+                    'cancelled_refunds':[dict(x) for x in c.execute("SELECT o.id,o.order_ref,c.name,COALESCE(p.paid,0)-COALESCE(r.refunded,0) refundable_cents FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN(SELECT order_id,SUM(amount_cents) paid FROM payments GROUP BY order_id)p ON p.order_id=o.id LEFT JOIN(SELECT order_id,SUM(amount_cents) refunded FROM refunds GROUP BY order_id)r ON r.order_id=o.id WHERE o.status='cancelled' AND COALESCE(p.paid,0)>COALESCE(r.refunded,0) LIMIT 20")]
+                }
+            return self.send_json({'metrics':metrics,'by_status':by_status,'by_method':by_method,'whatsapp':wa,'series':series,'top_services':top_services,'staff_performance':staff_performance,'unpaid':unpaid,'attention':attention})
         if path=='/api/admin/report':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
             end=q.get('to',[datetime.now().astimezone().date().isoformat()])[0]; period=q.get('period',['day'])[0]
@@ -221,7 +256,10 @@ class App(SimpleHTTPRequestHandler):
                 summary=dict(c.execute("""SELECT COUNT(*) orders,COALESCE(SUM(CASE WHEN status!='cancelled' THEN subtotal_cents ELSE 0 END),0) subtotal_cents,COALESCE(SUM(CASE WHEN status!='cancelled' THEN vat_cents ELSE 0 END),0) vat_cents,COALESCE(SUM(CASE WHEN status!='cancelled' THEN total_cents ELSE 0 END),0) total_cents FROM orders WHERE date(created_at) BETWEEN ? AND ?""",(start,end)).fetchone())
                 paid=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM payments WHERE date(created_at) BETWEEN ? AND ?',(start,end)).fetchone()[0];refunded=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM refunds WHERE date(created_at) BETWEEN ? AND ?',(start,end)).fetchone()[0];summary['paid_cents']=paid-refunded;summary['refund_cents']=refunded
                 services=[dict(x) for x in c.execute("""SELECT oi.item,oi.service,SUM(oi.quantity) quantity,SUM(oi.line_cents) sales_cents FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.status!='cancelled' AND date(o.created_at) BETWEEN ? AND ? GROUP BY oi.item,oi.service ORDER BY sales_cents DESC""",(start,end))]
-            summary['difference_cents']=summary['total_cents']-summary['paid_cents'];return self.send_json({'from':start,'to':end,'summary':summary,'services':services})
+                summary['expenses_cents']=c.execute('SELECT COALESCE(SUM(amount_cents),0) FROM expenses WHERE expense_date BETWEEN ? AND ?',(start,end)).fetchone()[0]
+                summary['discount_cents']=c.execute("SELECT COALESCE(SUM(discount_cents),0) FROM orders WHERE status!='cancelled' AND date(created_at) BETWEEN ? AND ?",(start,end)).fetchone()[0]
+                methods=[dict(x) for x in c.execute('''SELECT method,SUM(amount_cents) amount_cents FROM(SELECT method,amount_cents FROM payments WHERE date(created_at) BETWEEN ? AND ? UNION ALL SELECT method,-amount_cents FROM refunds WHERE date(created_at) BETWEEN ? AND ?)GROUP BY method''',(start,end,start,end))]
+            summary['difference_cents']=summary['total_cents']-summary['paid_cents'];summary['profit_cents']=summary['paid_cents']-summary['expenses_cents'];return self.send_json({'from':start,'to':end,'summary':summary,'services':services,'by_method':methods})
         if path=='/api/admin/export.csv':
             if not self.auth('admin'):return self.send_json({'error':'Unauthorized'},401)
             with db() as c: rows=c.execute('''SELECT o.order_ref,c.name,c.phone,o.status,o.total_cents,COALESCE(SUM(p.amount_cents),0) paid_cents,o.created_at FROM orders o JOIN customers c ON c.id=o.customer_id LEFT JOIN payments p ON p.order_id=o.id GROUP BY o.id ORDER BY o.id DESC''').fetchall()
@@ -248,7 +286,9 @@ class App(SimpleHTTPRequestHandler):
                 calc=hashpw(str(data.get('password','')),bytes.fromhex(r['salt']))[1];ok=hmac.compare_digest(calc,r['password_hash'])
             if not ok:history.append(time.time());return self.send_json({'error':'Invalid credentials'},401)
             token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(24); exp=(datetime.now(timezone.utc)+timedelta(hours=12)).isoformat(timespec='seconds')
-            with tx() as c:c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),r['username'],csrf,exp))
+            with tx() as c:
+                c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),r['username'],csrf,exp))
+                c.execute('UPDATE users SET last_login=? WHERE username=?',(now(),r['username']))
             return self.send_json({'user':{'username':r['username'],'name':r['name'],'role':r['role']},'csrf':csrf},headers={'Set-Cookie':f'laundry_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'})
         if path=='/api/whatsapp/webhook':
             secret=os.getenv('META_APP_SECRET',''); sig=self.headers.get('X-Hub-Signature-256','')
