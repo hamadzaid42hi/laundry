@@ -16,7 +16,7 @@ On the first start, random passwords are written to `runtime/credentials.txt`. T
 - Fast photo-based order entry with popular/recent items, search, direct service buttons, quantity controls, and a sticky basket.
 - Received, washing, ironing, ready, collected, due-today, and overdue order views.
 - Customer lookup by normalized full UAE phone number, visit/spend/balance history, preferences, and important notes.
-- Partial payments, admin-approved discounts, refunds, 5% VAT, receipt numbers, and 80 mm receipt printing.
+- Partial payments, admin-approved discounts, refunds, receipt numbers, and 80 mm receipt printing.
 - Daily/weekly/monthly reporting, cash/card reconciliation, unpaid orders, top services, staff results, expenses, and net profit.
 - Staff activation, password reset, granular permissions, and audit history.
 - Outgoing-only WhatsApp queue with deduplication, retries, delivery/read status, and uncollected-order reminders.
@@ -58,4 +58,4 @@ python -m unittest -v test_system.py
 6. Configure Meta WhatsApp credentials, approved Arabic/English templates, and a public HTTPS webhook.
 7. Run Supabase advisors, the automated tests, and a live end-to-end order/payment/refund/notification test.
 
-The server recalculates catalog prices, VAT and balances. Client totals are never trusted. Payment and WhatsApp event idempotency keys prevent repeated submissions.
+The server recalculates catalog prices and balances. Client totals are never trusted. Payment and WhatsApp event idempotency keys prevent repeated submissions.

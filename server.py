@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT=Path(__file__).resolve().parent; DATA=ROOT/'data'; RUNTIME=ROOT/'runtime'; DB=DATA/'laundry.sqlite3'
 DATA.mkdir(exist_ok=True); RUNTIME.mkdir(exist_ok=True)
 CATALOG=json.loads((ROOT/'prices.json').read_text(encoding='utf-8'))
-VAT=Decimal('0.05'); STATUSES=['received','washing','drying','ironing','ready','collected','cancelled']
+VAT=Decimal('0'); STATUSES=['received','washing','drying','ironing','ready','collected','cancelled']
 LOCK=threading.RLock(); LOGIN={}
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -83,6 +83,7 @@ def init_db():
                 c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
         defaults={'business_phone':'','tax_number':'','receipt_footer':'Thank you · شكراً لكم'}
         for k,v in defaults.items():c.execute('INSERT OR IGNORE INTO business_settings VALUES(?,?,?)',(k,v,now()))
+        c.execute("UPDATE orders SET total_cents=MAX(0,total_cents-vat_cents),vat_cents=0 WHERE vat_cents<>0")
         c.execute("UPDATE users SET permissions='[\"orders.create\",\"orders.status\",\"payments.create\",\"orders.cancel\"]' WHERE role='staff' AND permissions='[]'")
         c.execute("UPDATE users SET permissions='[\"*\"]' WHERE role='admin' AND permissions='[]'")
     with db() as c:

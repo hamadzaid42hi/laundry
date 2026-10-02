@@ -27,7 +27,7 @@ create table public.orders (
   customer_id uuid not null references public.customers(id) on delete restrict,
   status text not null check (status in ('received','washing','drying','ironing','ready','collected','cancelled')),
   subtotal_cents bigint not null check (subtotal_cents>=0),
-  vat_cents bigint not null check (vat_cents>=0),
+  vat_cents bigint not null default 0 check (vat_cents=0),
   discount_cents bigint not null default 0 check (discount_cents>=0),
   total_cents bigint not null check (total_cents>=0),
   expected_at timestamptz,
