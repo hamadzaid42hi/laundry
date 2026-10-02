@@ -11,9 +11,30 @@ Run `start-laundry.cmd`, then open:
 
 On the first start, random passwords are written to `runtime/credentials.txt`. This file is ignored by Git. Change the accounts before production use.
 
+## Operations included
+
+- Fast photo-based order entry with popular/recent items, search, direct service buttons, quantity controls, and a sticky basket.
+- Received, washing, ironing, ready, collected, due-today, and overdue order views.
+- Customer lookup by normalized full UAE phone number, visit/spend/balance history, preferences, and important notes.
+- Partial payments, admin-approved discounts, refunds, 5% VAT, receipt numbers, and 80 mm receipt printing.
+- Daily/weekly/monthly reporting, cash/card reconciliation, unpaid orders, top services, staff results, expenses, and net profit.
+- Staff activation, password reset, granular permissions, and audit history.
+- Outgoing-only WhatsApp queue with deduplication, retries, delivery/read status, and uncollected-order reminders.
+
 ## Data and backup
 
-The SQLite database is `data/laundry.sqlite3`. Stop the server before a file backup, or use SQLite's backup command. Verify a restored backup with `PRAGMA integrity_check;` before starting the application.
+The local database is `data/laundry.sqlite3`. `backup.py` creates an integrity-checked AES-GCM encrypted backup. Generate and securely retain a urlsafe base64 32-byte key, set it as `BACKUP_ENCRYPTION_KEY`, then run:
+
+```powershell
+python backup.py
+python backup.py --restore backups\encrypted\laundry-YYYYMMDD-HHMMSS.sqlite3.aes --target restored.sqlite3
+```
+
+Verify the restored database before replacing production data. `install-backup-task.ps1` installs a daily 02:00 Windows task; run it from an elevated PowerShell after setting the key. Losing the encryption key makes the backups unrecoverable.
+
+## Supabase migration
+
+The production PostgreSQL schema is prepared in `supabase/migrations/`. Every public table has RLS enabled and direct anonymous/authenticated table access is revoked; the current browser never receives the service-role key. The running local application still uses SQLite until a Supabase project is linked and the server data adapter is switched and verified. Apply the migration only to a reviewed project and run Supabase security/performance advisors before launch.
 
 ## WhatsApp
 
@@ -29,11 +50,12 @@ python -m unittest -v test_system.py
 
 ## Production checklist
 
-1. Put the application behind HTTPS and a reverse proxy.
-2. Replace bootstrap credentials and protect `runtime/` and `data/`.
-3. Configure automated encrypted backups and test restoration.
-4. Configure Meta WhatsApp credentials and approved Arabic/English templates.
-5. Restrict network access, monitor logs, and rotate secrets.
-6. Run the full test suite before every release.
+1. Link the intended Supabase project, apply the reviewed migration, then migrate and reconcile the SQLite data.
+2. Deploy behind HTTPS and configure the required environment variables in the hosting provider.
+3. Replace the local development passwords with strong unique production passwords.
+4. Protect `runtime/`, `data/`, backup files, and the encryption key.
+5. Configure and test automated encrypted backups and a complete restoration.
+6. Configure Meta WhatsApp credentials, approved Arabic/English templates, and a public HTTPS webhook.
+7. Run Supabase advisors, the automated tests, and a live end-to-end order/payment/refund/notification test.
 
 The server recalculates catalog prices, VAT and balances. Client totals are never trusted. Payment and WhatsApp event idempotency keys prevent repeated submissions.
